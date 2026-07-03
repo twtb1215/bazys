@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: bazys-api
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT --log-level warning
+    runtime: python-3.11.9
+    rootDir: backend
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ENVIRONMENT
+        value: production
