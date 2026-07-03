@@ -150,6 +150,7 @@ class Assessment(Base):
     ip_address = Column(String(50), default="")
     user_agent = Column(String(500), default="")
     started_at = Column(DateTime, nullable=True)
+    submitted_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

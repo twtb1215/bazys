@@ -22,15 +22,16 @@ router = APIRouter(prefix="/api/v1")
 templates = Jinja2Templates(directory="app/templates")
 
 
-# ─── Templates ────────────────────────────────────────────────────────────
+@router.get("/dashboard")
+def dashboard(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
 
 @router.post("/templates")
 def create_template(data: TemplateCreate, db: Session = Depends(get_db)):
-    """Create a new assessment template with questions."""
     template = AssessmentTemplate(name=data.name, description=data.description)
     db.add(template)
     db.flush()
-
     for i, q in enumerate(data.questions):
         question = Question(
             template_id=template.id,
@@ -47,19 +48,15 @@ def create_template(data: TemplateCreate, db: Session = Depends(get_db)):
             description=q.description,
         )
         db.add(question)
-
     db.commit()
     db.refresh(template)
-    return {"id": template.id, "name": template.name}
+    return {"id": template.id, "name": template.name, "questions_count": len(template.questions)}
 
 
 @router.get("/templates")
 def list_templates(db: Session = Depends(get_db)):
-    templates = db.query(AssessmentTemplate).all()
-    return [
-        {"id": t.id, "name": t.name, "questions_count": len(t.questions)}
-        for t in templates
-    ]
+    templates = db.query(AssessmentTemplate).order_by(AssessmentTemplate.id.desc()).all()
+    return [{"id": t.id, "name": t.name, "version": t.version, "questions_count": len(t.questions)} for t in templates]
 
 
 @router.get("/templates/{template_id}")
@@ -71,6 +68,7 @@ def get_template(template_id: int, db: Session = Depends(get_db)):
         "id": t.id,
         "name": t.name,
         "description": t.description,
+        "version": t.version,
         "questions": [
             {
                 "id": q.id,
@@ -83,21 +81,18 @@ def get_template(template_id: int, db: Session = Depends(get_db)):
                 "is_knockout": q.is_knockout,
                 "severity": q.severity,
                 "weight": q.weight,
+                "description": q.description,
             }
             for q in sorted(t.questions, key=lambda x: x.order)
         ],
     }
 
 
-# ─── Assessment Flow ──────────────────────────────────────────────────────
-
 @router.post("/assessments/start/{template_id}")
 def start_assessment(template_id: int, data: AssessmentStart, db: Session = Depends(get_db)):
-    """Create a new assessment and return a unique link."""
     template = db.query(AssessmentTemplate).filter(AssessmentTemplate.id == template_id).first()
     if not template:
         raise HTTPException(404, "Template not found")
-
     applicant = Applicant(
         full_name=data.full_name,
         email=data.email,
@@ -106,7 +101,6 @@ def start_assessment(template_id: int, data: AssessmentStart, db: Session = Depe
     )
     db.add(applicant)
     db.flush()
-
     token = secrets.token_urlsafe(32)
     assessment = Assessment(
         applicant_id=applicant.id,
@@ -117,24 +111,18 @@ def start_assessment(template_id: int, data: AssessmentStart, db: Session = Depe
     db.add(assessment)
     db.commit()
     db.refresh(assessment)
-
-    return {
-        "assessment_id": assessment.id,
-        "token": token,
-        "link": f"/assessment/{token}",
-    }
+    return {"assessment_id": assessment.id, "token": token, "link": f"/assessment/{token}"}
 
 
-@router.get("/api/v1/assessments/by-token/{token}")
+@router.get("/assessments/by-token/{token}")
 def get_assessment_by_token(token: str, db: Session = Depends(get_db)):
-    """Get assessment questions by token (for the applicant form)."""
     assessment = db.query(Assessment).filter(Assessment.token == token).first()
     if not assessment:
         raise HTTPException(404, "Assessment not found")
 
-    template = assessment.template
-    questions = [
-        {
+    questions = []
+    for q in sorted(assessment.template.questions, key=lambda x: x.order):
+        questions.append({
             "id": q.id,
             "order": q.order,
             "key": q.key,
@@ -143,9 +131,8 @@ def get_assessment_by_token(token: str, db: Session = Depends(get_db)):
             "options": q.options,
             "required": q.required,
             "description": q.description,
-        }
-        for q in sorted(template.questions, key=lambda x: x.order)
-    ]
+        })
+
     return {
         "assessment_id": assessment.id,
         "applicant_name": assessment.applicant.full_name,
@@ -153,15 +140,18 @@ def get_assessment_by_token(token: str, db: Session = Depends(get_db)):
     }
 
 
-@router.post("/api/v1/assessments/{assessment_id}/submit")
+@router.post("/assessments/{assessment_id}/submit")
 def submit_assessment(assessment_id: int, data: AssessmentSubmit, db: Session = Depends(get_db)):
-    """Submit answers and trigger evaluation."""
     assessment = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not assessment:
         raise HTTPException(404, "Assessment not found")
 
-    if assessment.status not in (ApplicationStatus.DRAFT, ApplicationStatus.SUBMITTED):
-        raise HTTPException(400, f"Assessment already {assessment.status.value}")
+    # Duplicate-safe submit
+    if assessment.status == ApplicationStatus.SUBMITTED:
+        raise HTTPException(409, "Assessment already submitted")
+
+    # Remove previous answers if resubmitting from draft
+    db.query(Answer).filter(Answer.assessment_id == assessment_id).delete()
 
     # Save answers
     for ans in data.answers:
@@ -173,38 +163,33 @@ def submit_assessment(assessment_id: int, data: AssessmentSubmit, db: Session = 
         db.add(answer)
 
     assessment.status = ApplicationStatus.SUBMITTED
+    from datetime import datetime
+    assessment.submitted_at = datetime.utcnow()
+
     db.commit()
-
-    # Run evaluation
-    evaluate_assessment(assessment_id, db)
-
+    try:
+        evaluate_assessment(assessment_id, db)
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(assessment)
+
     return {
         "decision": assessment.decision.value if assessment.decision else "unknown",
         "decision_reason": assessment.decision_reason,
         "total_score": assessment.total_score,
+        "status": assessment.status.value,
     }
 
 
-# ─── Manager Dashboard ────────────────────────────────────────────────────
-
 @router.get("/assessments")
-def list_assessments(
-    status: str = None,
-    decision: str = None,
-    limit: int = 50,
-    db: Session = Depends(get_db),
-):
-    """List all assessments (manager view)."""
+def list_assessments(status: str = None, decision: str = None, limit: int = 50, db: Session = Depends(get_db)):
     query = db.query(Assessment)
-
     if status:
         query = query.filter(Assessment.status == status)
     if decision:
         query = query.filter(Assessment.decision == decision)
-
     assessments = query.order_by(Assessment.created_at.desc()).limit(limit).all()
-
     return [
         AssessmentList(
             id=a.id,
@@ -221,7 +206,6 @@ def list_assessments(
 
 @router.get("/assessments/{assessment_id}")
 def get_assessment_detail(assessment_id: int, db: Session = Depends(get_db)):
-    """Full assessment detail for manager review."""
     a = db.query(Assessment).filter(Assessment.id == assessment_id).first()
     if not a:
         raise HTTPException(404, "Assessment not found")

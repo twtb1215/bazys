@@ -28,17 +28,15 @@
       border: none; padding: 12px 18px; border-radius: 8px; cursor: pointer;
       font-size: 15px;
     }
+    button[type="submit"]:disabled { opacity: 0.7; cursor: not-allowed; }
     .header { margin-bottom: 18px; }
     .header h1 { font-size: 20px; margin: 0 0 6px 0; }
     .header p { margin: 0; color: #6b7280; }
     .tag {
       display: inline-block; padding: 4px 10px; border-radius: 999px;
-      background: #eef2ff; color: #1d4ed8; font-size: 12px;
+      background: #eef2ff; color: #1d4ed8; font-size: 12px; margin-bottom: 10px;
     }
-    .result { font-size: 18px; font-weight: 700; margin-top: 8px; }
-    .result.knockout { color: #dc2626; }
-    .result.review { color: #d97706; }
-    .result.advance { color: #059669; }
+    .result-box { display:none; }
   </style>
 </head>
 <body>
@@ -52,27 +50,136 @@
     <div class="card" id="formCard">
       <form id="assessmentForm">
         <div id="questions"></div>
-        <button type="submit">Submit answers</button>
+        <button type="submit" id="submitBtn">Submit answers</button>
       </form>
     </div>
 
-    <div class="card" id="resultCard" style="display:none">
-      <div>Assessment submitted</div>
-      <div id="resultDecision" class="result"></div>
-      <div id="resultReason" style="color:#4b5563; margin-top:8px;"></div>
-      <div id="resultScore" style="color:#4b5563; margin-top:4px;"></div>
+    <div class="card result-box" id="resultCard">
+      <div style="font-size:18px; font-weight:700;">Thank you</div>
+      <div style="color:#4b5563; margin-top:8px;">Your application has been received.</div>
+      <div style="color:#6b7280; font-size:13px; margin-top:6px;">Our team will review it and contact you if needed.</div>
     </div>
   </div>
 
   <script>
-    (async () => {
-      const params = new URLSearchParams(window.location.search);
-      const token = params.get('token');
-      const tokenInput = document.getElementById('tokenInput');
-      if (!token && tokenInput) {
-        // parent can provide token
+    const token = '{{ token }}';
+    let assessmentId = {{ assessment_id }};
+
+    async function loadQuestions() {
+      const container = document.getElementById('questions');
+      container.innerHTML = '';
+      if (!token) {
+        document.getElementById('applicantName').textContent = 'Assessment not found.';
+        return;
       }
-    })();
+      try {
+        const res = await fetch('/api/v1/assessments/by-token/' + encodeURIComponent(token));
+        if (!res.ok) {
+          document.getElementById('applicantName').textContent = 'Assessment not found: ' + token;
+          return;
+        }
+        const data = await res.json();
+        document.getElementById('assessmentTitle').textContent = 'Assessment';
+        document.getElementById('applicantName').textContent = data.applicant_name ? 'Candidate: ' + data.applicant_name : '';
+
+        if (data.assessment_id && !assessmentId) {
+          assessmentId = data.assessment_id;
+        }
+
+        const questions = data.questions || [];
+        for (const q of questions) {
+          const row = document.createElement('div');
+          row.className = 'question';
+          const label = document.createElement('label');
+          label.textContent = q.label + (q.required ? ' *' : '');
+          row.appendChild(label);
+
+          let input;
+          if (q.options && q.options.length) {
+            input = document.createElement('select');
+            input.dataset.questionId = String(q.id);
+            input.dataset.key = q.key;
+            input.required = String(q.required);
+            const empty = document.createElement('option');
+            empty.value = '';
+            empty.textContent = 'Select...';
+            input.appendChild(empty);
+            for (const opt of q.options) {
+              const o = document.createElement('option');
+              o.value = opt;
+              o.textContent = opt;
+              input.appendChild(o);
+            }
+            row.appendChild(input);
+          } else if (q.question_type === 'textarea') {
+            input = document.createElement('textarea');
+            input.dataset.questionId = String(q.id);
+            input.dataset.key = q.key;
+            input.required = String(q.required);
+            row.appendChild(input);
+          } else {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.dataset.questionId = String(q.id);
+            input.dataset.key = q.key;
+            input.required = String(q.required);
+            row.appendChild(input);
+          }
+
+          if (q.description) {
+            const hint = document.createElement('div');
+            hint.className = 'hint';
+            hint.textContent = q.description;
+            row.appendChild(hint);
+          }
+          container.appendChild(row);
+        }
+      } catch (err) {
+        document.getElementById('applicantName').textContent = 'Network error while loading questions.';
+      }
+    }
+
+    async function submitAnswers(e) {
+      e.preventDefault();
+      const submitBtn = document.getElementById('submitBtn');
+      if (!assessmentId) {
+        alert('Assessment not loaded yet. Please refresh.');
+        return;
+      }
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Submitting...';
+
+      try {
+        const inputs = document.querySelectorAll('#questions [data-question-id]');
+        const answers = Array.from(inputs).map((el) => ({
+          question_id: Number(el.dataset.questionId),
+          value: (el.value || '').trim(),
+        }));
+
+        const res = await fetch('/api/v1/assessments/' + assessmentId + '/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answers }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          document.getElementById('applicantName').textContent = data.detail || 'Submit failed.';
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Submit answers';
+          return;
+        }
+
+        document.getElementById('formCard').style.display = 'none';
+        document.getElementById('resultCard').style.display = 'block';
+      } catch (err) {
+        document.getElementById('applicantName').textContent = 'Network error while submitting.';
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Submit answers';
+      }
+    }
+
+    document.getElementById('assessmentForm').addEventListener('submit', submitAnswers);
+    loadQuestions();
   </script>
 </body>
 </html>
